@@ -618,6 +618,22 @@ if (els.driveStatus)
 if (els.importStatus)
   els.importStatus.textContent = 'Origem: Nenhum documento carregado';
 
+function prettyError(err){
+  try{
+    if (err && err.result && err.result.error){
+      const er = err.result.error;
+      const code = er.code || '';
+      const status = er.status || '';
+      const msg = er.message || JSON.stringify(er);
+      return `${code} ${status} - ${msg}`;
+    }
+    if (err && err.error){
+      return (typeof err.error === 'string') ? err.error : JSON.stringify(err.error);
+    }
+    return (typeof err === 'string') ? err : JSON.stringify(err);
+  }catch(_){ return String(err); }
+}
+
   (function fillPacksDatalist(){
     const dl = document.getElementById('packsList');
     for(let i=1;i<=40;i++){
@@ -1262,20 +1278,25 @@ btCfgS?.addEventListener('click', ()=>{
 els.btnDrive?.addEventListener('click', async ()=>{
   try{
     if(!DRIVE_API_KEY || !DRIVE_CLIENT_ID){
-      // abre o painel de configuração para o usuário preencher
+      // abre o painel para preencher as chaves
       openDriveCfg?.();
       if(els.driveStatus) els.driveStatus.textContent = 'Drive: informe API Key e Client ID';
       return;
     }
 
     if(els.driveStatus) els.driveStatus.textContent = 'Drive: carregando Google APIs…';
-    await new Promise((res,rej)=> {
-      try{ loadGapi(res); } catch(e){ rej(e); }
-    });
+    await new Promise((res,rej)=>{ try{ loadGapi(res); } catch(e){ rej(e); } });
 
     const g = window.gapi;
+
     if(els.driveStatus) els.driveStatus.textContent = 'Drive: inicializando cliente…';
-    await new Promise(r=>g.load('client:auth2', r));
+    // protege contra “travar” no load
+    const timeout = (ms,msg)=> new Promise((_,rej)=> setTimeout(()=>rej(new Error(msg)), ms));
+    await Promise.race([
+      new Promise(r=>g.load('client:auth2', r)),
+      timeout(12000,'Timeout carregando gapi auth2')
+    ]);
+
     await g.client.init({
       apiKey: DRIVE_API_KEY,
       discoveryDocs: [DRIVE_DISCOVERY],
@@ -1286,45 +1307,91 @@ els.btnDrive?.addEventListener('click', async ()=>{
     const auth = g.auth2.getAuthInstance();
     if(!auth.isSignedIn.get()){
       if(els.driveStatus) els.driveStatus.textContent = 'Drive: solicitando login…';
-      await auth.signIn(); // aqui o navegador pode abrir pop-up
+      await auth.signIn(); // abre pop-up
     }
 
-    // Conectado — tenta mostrar e-mail
+    // conectado — mostra e-mail, se disponível
     try{
       const user = auth.currentUser.get();
       const profile = user?.getBasicProfile?.();
       const email = profile?.getEmail?.() || '';
-      if(els.driveStatus) els.driveStatus.textContent = email ? `Drive: Conectado (${email})` : 'Drive: Conectado';
-    }catch{ if(els.driveStatus) els.driveStatus.textContent = 'Drive: Conectado'; }
+      if(els.driveStatus) els.driveStatus.textContent = email
+        ? `Drive: Conectado (${email})` : 'Drive: Conectado';
+    }catch(_){
+      if(els.driveStatus) els.driveStatus.textContent = 'Drive: Conectado';
+    }
 
-    // Carrega e abre o Picker (seletor do Drive)
+    // carregar Picker
     if(els.driveStatus) els.driveStatus.textContent = 'Drive: abrindo seletor…';
-    g.load('picker', {'callback': ()=>{
-      try{
-        const token = g.client.getToken().access_token;
-        const view  = new google.picker.DocsView(google.picker.ViewId.DOCS)
-          .setIncludeFolders(true).setSelectFolderEnabled(true);
-        const picker = new google.picker.PickerBuilder()
-          .setOAuthToken(token)
-          .setDeveloperKey(DRIVE_API_KEY)
-          .addView(view)
-          .setTitle('Selecione arquivos / pastas')
-          .setCallback(async (data)=>{
-            if(data.action !== google.picker.Action.PICKED) return;
-            // ... (seu código de import permanece igual)
-          })
-          .build();
-        picker.setVisible(true);
-      }catch(e){
-        console.error(e);
-        if(els.driveStatus) els.driveStatus.textContent = 'Drive: erro ao abrir seletor';
-        alert('Falha ao abrir o seletor do Drive: ' + (e.result?.error?.message || e.message || e));
-      }
-    }});
+    await Promise.race([
+      new Promise(r=>g.load('picker', r)),
+      timeout(12000,'Timeout carregando picker')
+    ]);
+
+    // token pode estar em client OU em auth, usamos fallback
+    const token =
+      (g.client.getToken && g.client.getToken()?.access_token) ||
+      (g.auth.getToken && g.auth.getToken()?.access_token) || '';
+
+    const view = new google.picker.DocsView(google.picker.ViewId.DOCS)
+      .setIncludeFolders(true)
+      .setSelectFolderEnabled(true);
+
+    const picker = new google.picker.PickerBuilder()
+      .setOAuthToken(token)
+      .setDeveloperKey(DRIVE_API_KEY)
+      .setOrigin(window.location.origin) // evita origin_mismatch no Picker
+      .addView(view)
+      .setTitle('Selecione arquivos / pastas')
+      .setCallback(async (data)=>{
+        if(data.action !== google.picker.Action.PICKED) return;
+
+        const files = data.docs || [];
+        for(const f of files){
+          try{
+            // metadados
+            const meta = await g.client.drive.files.get({
+              fileId: f.id, fields: 'id,name,mimeType'
+            });
+            const m = meta.result;
+
+            // baixa conteúdo (exporta Google Docs como txt)
+            let blob;
+            if(m.mimeType.startsWith('application/vnd.google-apps.')){
+              const res = await g.client.drive.files.export({
+                fileId: m.id, mimeType: 'text/plain'
+              });
+              const txt = res.body || '';
+              blob = new Blob([txt], { type: 'text/plain' });
+            }else{
+              const res = await g.client.drive.files.get({
+                fileId: m.id, alt: 'media'
+              });
+              const b = res.body;
+              blob = new Blob([b]);
+            }
+
+            const file = new File([blob], m.name, { type: blob.type || 'application/octet-stream' });
+            selectedFiles = mergeFileLists(selectedFiles, [file]);
+          }catch(e){ console.warn('Drive get error', e); }
+        }
+
+        renderFileList();
+        indexedDocs = []; // força reindexar
+        if(els.importStatus){
+          const n = selectedFiles.length;
+          els.importStatus.textContent = `Origem: Google Drive (${n} arquivo${n>1?'s':''})`;
+        }
+        alert('Arquivos do Drive adicionados.');
+      })
+      .build();
+
+    picker.setVisible(true);
+
   }catch(e){
     console.error(e);
     if(els.driveStatus) els.driveStatus.textContent = 'Drive: erro ao conectar';
-    alert('Erro ao conectar ao Google Drive: ' + (e.result?.error?.message || e.message || e));
+    alert('Erro ao conectar ao Google Drive: ' + prettyError(e));
   }
 });
 
@@ -1485,14 +1552,24 @@ createDownloadLink(fname, text);
   const DRIVE_SCOPE   = 'https://www.googleapis.com/auth/drive.file';
   const DRIVE_DISCOVERY = 'https://www.googleapis.com/discovery/v1/apis/drive/v3/rest';
 
-  function loadGapi(callback){
-    if(window.gapi && window.google && window.google.picker){ callback(); return; }
-    const s1 = document.createElement('script'); s1.src='https://apis.google.com/js/api.js';
-    const s2 = document.createElement('script'); s2.src='https://apis.google.com/js/platform.js';
-    const s3 = document.createElement('script'); s3.src='https://apis.google.com/js/api.js?onload=onGapiLoad';
-    window.onGapiLoad = ()=> callback();
-    document.head.appendChild(s1); document.head.appendChild(s2); document.head.appendChild(s3);
-  }
+  let gapiLoading = null;
+function loadGapi(callback){
+  if (window.gapi) { callback(); return; }
+  if (gapiLoading) { gapiLoading.then(callback); return; }
+
+  gapiLoading = new Promise((resolve, reject)=>{
+    const s = document.createElement('script');
+    s.src = 'https://apis.google.com/js/api.js';
+    s.onload = resolve;
+    s.onerror = ()=> reject(new Error('Falha ao carregar gapi (api.js)'));
+    document.head.appendChild(s);
+  });
+
+  gapiLoading.then(callback).catch((e)=>{
+    console.error(e);
+    alert('Google API não carregou: ' + (e.message || e));
+  });
+}
 </script>
   <script>
 (function(){
